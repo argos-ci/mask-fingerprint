@@ -142,7 +142,7 @@ fn clamp_u32_to_u8(v: u32) -> u8 {
 /* ---------------------------------- NAPI ---------------------------------- */
 
 #[napi]
-pub fn fingerprint_diff_for_equality(
+pub fn fingerprint_diff(
   png_bytes: Buffer,
   options: Option<JsEqualityFingerprintOptions>,
 ) -> napi::Result<String> {

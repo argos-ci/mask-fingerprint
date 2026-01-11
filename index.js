@@ -576,4 +576,4 @@ if (!nativeBinding) {
 }
 
 module.exports = nativeBinding
-module.exports.fingerprintDiffForEquality = nativeBinding.fingerprintDiffForEquality
+module.exports.fingerprintDiff = nativeBinding.fingerprintDiff

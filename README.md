@@ -43,7 +43,7 @@ Small local differences usually do not change the final fingerprint.
 
 ### Requirements
 
-- Node.js 18 or newer
+- Node.js 24 or newer
 - Rust stable
 - Cargo
 
@@ -65,11 +65,11 @@ This builds the native module.
 
 ```ts
 import fs from 'node:fs'
-import { fingerprint_diff_for_equality } from 'mask-fingerprint'
+import { fingerprintDiff } from 'mask-fingerprint'
 
 const png = fs.readFileSync('diff.png')
 
-const fingerprint = fingerprint_diff_for_equality(png, {
+const fingerprint = fingerprintDiff(png, {
   gridSize: 16,
   dilateRadius: 1,
   padToSquare: true,
@@ -90,7 +90,7 @@ The returned value is designed to be stored in a database, indexed, and compared
 
 ## API
 
-### `fingerprint_diff_for_equality(buffer, options?)`
+### `fingerprintDiff(buffer, options?)`
 
 #### Parameters
 

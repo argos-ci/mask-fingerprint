@@ -2,7 +2,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 
-import { fingerprintDiffForEquality } from '../index'
+import { fingerprintDiff } from '../index'
 
 describe('diff fingerprint', () => {
   it('generates a same fingerprint for similar diffs', () => {
@@ -12,7 +12,7 @@ describe('diff fingerprint', () => {
       const diffPath = path.join(fixturesDir, name)
       const buffer = fs.readFileSync(diffPath)
       console.time(name)
-      const res = fingerprintDiffForEquality(buffer)
+      const res = fingerprintDiff(buffer)
       console.timeEnd(name)
       return res
     }
