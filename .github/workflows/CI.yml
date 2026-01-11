@@ -209,8 +209,7 @@ jobs:
           " >> $GITHUB_OUTPUT
       - name: Install dependencies
         run: |
-          pnpm config set supportedArchitectures.cpu '["current","arm64","x64","arm"]'
-          pnpm config set supportedArchitectures.libc '["current","musl","gnu"]'
+          pnpm config set --location project --json supportedArchitectures '{"cpu":["current","arm64","x64","arm"],"libc":["current","musl","gnu"]}'
           pnpm install
       - name: Download artifacts
         uses: actions/download-artifact@v7
@@ -232,7 +231,10 @@ jobs:
         with:
           image: ${{ steps.docker.outputs.IMAGE }}
           options: '-v ${{ github.workspace }}:${{ github.workspace }} -w ${{ github.workspace }} --platform ${{ steps.docker.outputs.PLATFORM }}'
-          run: pnpm test
+          run: |
+            corepack enable
+            corepack install
+            pnpm test
 
   publish:
     name: Publish

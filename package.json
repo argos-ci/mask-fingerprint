@@ -1,6 +1,6 @@
 {
   "name": "@argos-ci/mask-fingerprint",
-  "version": "1.0.0",
+  "version": "0.0.0",
   "description": "Fast, deterministic visual diff fingerprinting for PNG images, exposed as a Node.js native module via N-API.",
   "main": "index.js",
   "repository": {
@@ -33,7 +33,7 @@
     ]
   },
   "engines": {
-    "node": ">24"
+    "node": ">24.0.0"
   },
   "publishConfig": {
     "registry": "https://registry.npmjs.org/",
