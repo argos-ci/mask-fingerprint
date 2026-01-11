@@ -200,13 +200,11 @@ fn decode_png_to_rgba(png_bytes: &[u8]) -> napi::Result<(Vec<u8>, usize, usize)>
 fn rgb8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
   let n = width * height;
   let mut out = vec![0u8; n * 4];
-  for i in 0..n {
-    let s = i * 3;
-    let d = i * 4;
-    out[d] = src[s];
-    out[d + 1] = src[s + 1];
-    out[d + 2] = src[s + 2];
-    out[d + 3] = 255;
+  for (dst, src_px) in out.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
+    dst[0] = src_px[0];
+    dst[1] = src_px[1];
+    dst[2] = src_px[2];
+    dst[3] = 255;
   }
   out
 }
@@ -214,13 +212,11 @@ fn rgb8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
 fn gray8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
   let n = width * height;
   let mut out = vec![0u8; n * 4];
-  for i in 0..n {
-    let v = src[i];
-    let d = i * 4;
-    out[d] = v;
-    out[d + 1] = v;
-    out[d + 2] = v;
-    out[d + 3] = 255;
+  for (dst, &v) in out.chunks_exact_mut(4).zip(src.iter()) {
+    dst[0] = v;
+    dst[1] = v;
+    dst[2] = v;
+    dst[3] = 255;
   }
   out
 }
@@ -228,15 +224,12 @@ fn gray8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
 fn gray_alpha8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
   let n = width * height;
   let mut out = vec![0u8; n * 4];
-  for i in 0..n {
-    let s = i * 2;
-    let v = src[s];
-    let a = src[s + 1];
-    let d = i * 4;
-    out[d] = v;
-    out[d + 1] = v;
-    out[d + 2] = v;
-    out[d + 3] = a;
+  for (dst, src_px) in out.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
+    let v = src_px[0];
+    dst[0] = v;
+    dst[1] = v;
+    dst[2] = v;
+    dst[3] = src_px[1];
   }
   out
 }
@@ -314,14 +307,13 @@ fn extract_red_mask(rgba: &[u8], width: usize, height: usize, t: RedThreshold) -
   let n = width * height;
   let mut out = vec![0u8; n];
 
-  for i in 0..n {
-    let o = i * 4;
-    let r = rgba[o];
-    let g = rgba[o + 1];
-    let b = rgba[o + 2];
-    let a = rgba[o + 3];
+  for (dst, px) in out.iter_mut().zip(rgba.chunks_exact(4)) {
+    let r = px[0];
+    let g = px[1];
+    let b = px[2];
+    let a = px[3];
 
-    out[i] = if r >= t.r_min && g <= t.g_max && b <= t.b_max && a >= t.a_min {
+    *dst = if r >= t.r_min && g <= t.g_max && b <= t.b_max && a >= t.a_min {
       1
     } else {
       0
@@ -521,7 +513,7 @@ fn get_integral(integral: &[u32], w: usize, x: isize, y: isize) -> u32 {
 }
 
 fn pack_2bit(values: &[u8]) -> Vec<u8> {
-  let mut out = vec![0u8; (values.len() + 3) / 4];
+  let mut out = vec![0u8; values.len().div_ceil(4)];
 
   for (i, &v) in values.iter().enumerate() {
     let vv = v & 3;
