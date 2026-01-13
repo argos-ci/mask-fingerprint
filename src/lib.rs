@@ -1,6 +1,6 @@
 #![deny(clippy::all)]
 
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Either};
 use napi_derive::napi;
 use std::io::{BufReader, Cursor};
 
@@ -143,10 +143,29 @@ fn clamp_u32_to_u8(v: u32) -> u8 {
 
 #[napi]
 pub fn fingerprint_diff(
-  png_bytes: Buffer,
+  png_input: Either<String, Buffer>,
   options: Option<JsEqualityFingerprintOptions>,
 ) -> napi::Result<String> {
-  let (rgba, width, height) = decode_png_to_rgba(&png_bytes)?;
+  enum InputBytes {
+    File(Vec<u8>),
+    Buffer(Buffer),
+  }
+
+  let input = match png_input {
+    Either::A(path) => {
+      let bytes = std::fs::read(&path)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to read PNG file '{path}': {e}")))?;
+      InputBytes::File(bytes)
+    }
+    Either::B(buffer) => InputBytes::Buffer(buffer),
+  };
+
+  let png_bytes: &[u8] = match &input {
+    InputBytes::File(bytes) => bytes.as_slice(),
+    InputBytes::Buffer(buffer) => buffer.as_ref(),
+  };
+
+  let (rgba, width, height) = decode_png_to_rgba(png_bytes)?;
   let opts = build_options(options)?;
   Ok(fingerprint_rgba_for_equality(&rgba, width, height, &opts))
 }
@@ -177,10 +196,13 @@ fn decode_png_to_rgba(png_bytes: &[u8]) -> napi::Result<(Vec<u8>, usize, usize)>
 
   let width = info.width as usize;
   let height = info.height as usize;
-  let bytes = &buf[..info.buffer_size()];
+  if info.color_type == png::ColorType::Rgba && info.bit_depth == png::BitDepth::Eight {
+    buf.truncate(info.buffer_size());
+    return Ok((buf, width, height));
+  }
 
+  let bytes = &buf[..info.buffer_size()];
   let rgba = match (info.color_type, info.bit_depth) {
-    (png::ColorType::Rgba, png::BitDepth::Eight) => bytes.to_vec(),
     (png::ColorType::Rgb, png::BitDepth::Eight) => rgb8_to_rgba8(bytes, width, height),
     (png::ColorType::Grayscale, png::BitDepth::Eight) => gray8_to_rgba8(bytes, width, height),
     (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
@@ -278,7 +300,7 @@ fn fingerprint_rgba_for_equality(
     cropped
   };
 
-  let q = quantize_to_grid_density(
+  let h = hash_grid_density(
     &normalized.data,
     normalized.width,
     normalized.height,
@@ -286,9 +308,6 @@ fn fingerprint_rgba_for_equality(
     options.grid_size,
     &options.density_thresholds,
   );
-
-  let packed = pack_2bit(&q);
-  let h = fnv1a64(&packed);
 
   let t_joined = options
     .density_thresholds
@@ -433,16 +452,20 @@ fn pad_binary_to_square(src: &[u8], src_w: usize, src_h: usize) -> BinaryImage {
   }
 }
 
-fn quantize_to_grid_density(
+fn hash_grid_density(
   src: &[u8],
   src_w: usize,
   src_h: usize,
   grid_w: usize,
   grid_h: usize,
   thresholds: &[f32],
-) -> Vec<u8> {
+) -> u64 {
   let integral = build_integral_image(src, src_w, src_h);
-  let mut out = vec![0u8; grid_w * grid_h];
+  let mut hash: u64 = 0xcbf29ce484222325;
+  let prime: u64 = 0x00000100000001b3;
+  // Stream packed 2-bit quantized values into the hash to avoid extra buffers.
+  let mut packed_byte: u8 = 0;
+  let mut byte_shift: u8 = 0;
 
   for gy in 0..grid_h {
     let y0 = (gy * src_h) / grid_h;
@@ -456,11 +479,25 @@ fn quantize_to_grid_density(
       let sum = rect_sum(&integral, src_w, x0, y0, x1, y1);
       let density = (sum as f32) / (area as f32);
 
-      out[gy * grid_w + gx] = quantize_density(density, thresholds);
+      let v = quantize_density(density, thresholds) & 3;
+      packed_byte |= v << byte_shift;
+      if byte_shift == 6 {
+        hash ^= packed_byte as u64;
+        hash = hash.wrapping_mul(prime);
+        packed_byte = 0;
+        byte_shift = 0;
+      } else {
+        byte_shift += 2;
+      }
     }
   }
 
-  out
+  if byte_shift != 0 {
+    hash ^= packed_byte as u64;
+    hash = hash.wrapping_mul(prime);
+  }
+
+  hash
 }
 
 fn quantize_density(density: f32, thresholds: &[f32]) -> u8 {
@@ -510,29 +547,4 @@ fn get_integral(integral: &[u32], w: usize, x: isize, y: isize) -> u32 {
   } else {
     integral[y as usize * w + x as usize]
   }
-}
-
-fn pack_2bit(values: &[u8]) -> Vec<u8> {
-  let mut out = vec![0u8; values.len().div_ceil(4)];
-
-  for (i, &v) in values.iter().enumerate() {
-    let vv = v & 3;
-    let byte_index = i / 4;
-    let shift = (i & 3) * 2;
-    out[byte_index] |= vv << shift;
-  }
-
-  out
-}
-
-fn fnv1a64(data: &[u8]) -> u64 {
-  let mut hash: u64 = 0xcbf29ce484222325;
-  let prime: u64 = 0x00000100000001b3;
-
-  for &b in data {
-    hash ^= b as u64;
-    hash = hash.wrapping_mul(prime);
-  }
-
-  hash
 }
