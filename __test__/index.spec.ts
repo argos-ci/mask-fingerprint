@@ -32,6 +32,7 @@ describe('diff fingerprint', () => {
     const fB1 = generateFingerprintFromFilename('diff-B1.png')
     const fLong = generateFingerprintFromFilename('long-diff.png')
 
+    expect(fA1).toBe('v1:g16:d1:t0.002,0.02,0.08:202566ca9533046b')
     expect(fA1).toBe(fA2)
     expect(fA1).toBe(fA3)
     expect(fA1).toBe(fA1Path)
