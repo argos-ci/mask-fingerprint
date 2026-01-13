@@ -69,7 +69,7 @@ import { fingerprintDiff } from 'mask-fingerprint'
 
 const png = fs.readFileSync('diff.png')
 
-const fingerprint = fingerprintDiff(png, {
+const fingerprint = await fingerprintDiff(png, {
   gridSize: 16,
   dilateRadius: 1,
   padToSquare: true,
@@ -91,6 +91,8 @@ The returned value is designed to be stored in a database, indexed, and compared
 ## API
 
 ### `fingerprintDiff(buffer, options?)`
+
+Returns a `Promise<string>`.
 
 #### Parameters
 
