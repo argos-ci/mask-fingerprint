@@ -1,6 +1,6 @@
 #![deny(clippy::all)]
 
-use napi::bindgen_prelude::Buffer;
+use napi::bindgen_prelude::{Buffer, Either};
 use napi_derive::napi;
 use std::io::{BufReader, Cursor};
 
@@ -143,10 +143,30 @@ fn clamp_u32_to_u8(v: u32) -> u8 {
 
 #[napi]
 pub fn fingerprint_diff(
-  png_bytes: Buffer,
+  png_input: Either<String, Buffer>,
   options: Option<JsEqualityFingerprintOptions>,
 ) -> napi::Result<String> {
-  let (rgba, width, height) = decode_png_to_rgba(&png_bytes)?;
+  enum InputBytes {
+    File(Vec<u8>),
+    Buffer(Buffer),
+  }
+
+  let input = match png_input {
+    Either::A(path) => {
+      let bytes = std::fs::read(&path).map_err(|e| {
+        napi::Error::from_reason(format!("Failed to read PNG file '{path}': {e}"))
+      })?;
+      InputBytes::File(bytes)
+    }
+    Either::B(buffer) => InputBytes::Buffer(buffer),
+  };
+
+  let png_bytes: &[u8] = match &input {
+    InputBytes::File(bytes) => bytes.as_slice(),
+    InputBytes::Buffer(buffer) => buffer.as_ref(),
+  };
+
+  let (rgba, width, height) = decode_png_to_rgba(png_bytes)?;
   let opts = build_options(options)?;
   Ok(fingerprint_rgba_for_equality(&rgba, width, height, &opts))
 }
