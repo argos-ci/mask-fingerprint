@@ -153,9 +153,8 @@ pub fn fingerprint_diff(
 
   let input = match png_input {
     Either::A(path) => {
-      let bytes = std::fs::read(&path).map_err(|e| {
-        napi::Error::from_reason(format!("Failed to read PNG file '{path}': {e}"))
-      })?;
+      let bytes = std::fs::read(&path)
+        .map_err(|e| napi::Error::from_reason(format!("Failed to read PNG file '{path}': {e}")))?;
       InputBytes::File(bytes)
     }
     Either::B(buffer) => InputBytes::Buffer(buffer),
