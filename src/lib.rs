@@ -179,7 +179,7 @@ impl Task for FingerprintDiffTask {
   }
 }
 
-#[napi]
+#[napi(ts_return_type = "Promise<string>")]
 pub fn fingerprint_diff(
   png_input: Either<String, Buffer>,
   options: Option<JsEqualityFingerprintOptions>,
