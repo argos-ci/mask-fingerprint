@@ -1,7 +1,7 @@
 #![deny(clippy::all)]
 
-use napi::{Env, Task};
 use napi::bindgen_prelude::{AsyncTask, Buffer, Either};
+use napi::{Env, Task};
 use napi_derive::napi;
 use std::io::{BufReader, Cursor};
 
