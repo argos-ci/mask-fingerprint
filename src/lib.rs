@@ -1,6 +1,7 @@
 #![deny(clippy::all)]
 
-use napi::bindgen_prelude::{Buffer, Either};
+use napi::bindgen_prelude::{AsyncTask, Buffer, Either};
+use napi::{Env, Task};
 use napi_derive::napi;
 use std::io::{BufReader, Cursor};
 
@@ -141,33 +142,54 @@ fn clamp_u32_to_u8(v: u32) -> u8 {
 
 /* ---------------------------------- NAPI ---------------------------------- */
 
-#[napi]
+enum InputBytes {
+  Path(String),
+  Bytes(Vec<u8>),
+}
+
+pub struct FingerprintDiffTask {
+  input: InputBytes,
+  options: Option<JsEqualityFingerprintOptions>,
+}
+
+impl Task for FingerprintDiffTask {
+  type Output = String;
+  type JsValue = String;
+
+  fn compute(&mut self) -> napi::Result<Self::Output> {
+    let opts = build_options(self.options.take())?;
+
+    match &self.input {
+      InputBytes::Path(path) => {
+        let png_bytes = std::fs::read(path).map_err(|e| {
+          napi::Error::from_reason(format!("Failed to read PNG file '{path}': {e}"))
+        })?;
+        let (rgba, width, height) = decode_png_to_rgba(&png_bytes)?;
+        Ok(fingerprint_rgba_for_equality(&rgba, width, height, &opts))
+      }
+      InputBytes::Bytes(png_bytes) => {
+        let (rgba, width, height) = decode_png_to_rgba(png_bytes)?;
+        Ok(fingerprint_rgba_for_equality(&rgba, width, height, &opts))
+      }
+    }
+  }
+
+  fn resolve(&mut self, _env: Env, output: Self::Output) -> napi::Result<Self::JsValue> {
+    Ok(output)
+  }
+}
+
+#[napi(ts_return_type = "Promise<string>")]
 pub fn fingerprint_diff(
   png_input: Either<String, Buffer>,
   options: Option<JsEqualityFingerprintOptions>,
-) -> napi::Result<String> {
-  enum InputBytes {
-    File(Vec<u8>),
-    Buffer(Buffer),
-  }
-
+) -> napi::Result<AsyncTask<FingerprintDiffTask>> {
   let input = match png_input {
-    Either::A(path) => {
-      let bytes = std::fs::read(&path)
-        .map_err(|e| napi::Error::from_reason(format!("Failed to read PNG file '{path}': {e}")))?;
-      InputBytes::File(bytes)
-    }
-    Either::B(buffer) => InputBytes::Buffer(buffer),
+    Either::A(path) => InputBytes::Path(path),
+    Either::B(buffer) => InputBytes::Bytes(buffer.to_vec()),
   };
 
-  let png_bytes: &[u8] = match &input {
-    InputBytes::File(bytes) => bytes.as_slice(),
-    InputBytes::Buffer(buffer) => buffer.as_ref(),
-  };
-
-  let (rgba, width, height) = decode_png_to_rgba(png_bytes)?;
-  let opts = build_options(options)?;
-  Ok(fingerprint_rgba_for_equality(&rgba, width, height, &opts))
+  Ok(AsyncTask::new(FingerprintDiffTask { input, options }))
 }
 
 /* -------------------------------- PNG decode -------------------------------- */
