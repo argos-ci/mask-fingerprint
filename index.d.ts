@@ -8,6 +8,7 @@ export interface JsEqualityFingerprintOptions {
   gridSize?: number
   densityThresholds?: Array<number>
   padToSquare?: boolean
+  maxBytes?: number
 }
 
 export interface JsRedThreshold {
