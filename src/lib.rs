@@ -3,7 +3,10 @@
 use napi::bindgen_prelude::{AsyncTask, Buffer, Either};
 use napi::{Env, Task};
 use napi_derive::napi;
-use std::io::{BufReader, Cursor};
+use std::fs::File;
+use std::io::{BufRead, BufReader, Cursor, Seek};
+
+/* ---------------------------------- options --------------------------------- */
 
 #[derive(Clone, Copy, Debug)]
 struct RedThreshold {
@@ -20,6 +23,7 @@ struct EqualityFingerprintOptions {
   grid_size: usize,  // 8, 16, 32
   density_thresholds: Vec<f32>,
   pad_to_square: bool,
+  max_bytes: usize,
 }
 
 impl Default for EqualityFingerprintOptions {
@@ -35,6 +39,7 @@ impl Default for EqualityFingerprintOptions {
       grid_size: 16,
       density_thresholds: vec![0.002, 0.02, 0.08],
       pad_to_square: true,
+      max_bytes: 200 * 1024 * 1024,
     }
   }
 }
@@ -56,6 +61,7 @@ pub struct JsEqualityFingerprintOptions {
   pub grid_size: Option<u32>,     // 8, 16, 32
   pub density_thresholds: Option<Vec<f64>>,
   pub pad_to_square: Option<bool>,
+  pub max_bytes: Option<u32>,
 }
 
 fn build_options(
@@ -83,6 +89,14 @@ fn build_options(
 
   if let Some(v) = js.pad_to_square {
     opts.pad_to_square = v;
+  }
+
+  if let Some(v) = js.max_bytes {
+    let v = v as usize;
+    if v < 1024 * 1024 {
+      return Err(napi::Error::from_reason("maxBytes must be at least 1MB"));
+    }
+    opts.max_bytes = v;
   }
 
   if let Some(th) = js.density_thresholds {
@@ -144,7 +158,7 @@ fn clamp_u32_to_u8(v: u32) -> u8 {
 
 enum InputBytes {
   Path(String),
-  Bytes(Vec<u8>),
+  Bytes(Buffer),
 }
 
 pub struct FingerprintDiffTask {
@@ -160,17 +174,9 @@ impl Task for FingerprintDiffTask {
     let opts = build_options(self.options.take())?;
 
     match &self.input {
-      InputBytes::Path(path) => {
-        let png_bytes = std::fs::read(path).map_err(|e| {
-          napi::Error::from_reason(format!("Failed to read PNG file '{path}': {e}"))
-        })?;
-        let (rgba, width, height) = decode_png_to_rgba(&png_bytes)?;
-        Ok(fingerprint_rgba_for_equality(&rgba, width, height, &opts))
-      }
-      InputBytes::Bytes(png_bytes) => {
-        let (rgba, width, height) = decode_png_to_rgba(png_bytes)?;
-        Ok(fingerprint_rgba_for_equality(&rgba, width, height, &opts))
-      }
+      InputBytes::Path(path) => fingerprint_two_pass_from_path(path, &opts),
+
+      InputBytes::Bytes(buf) => fingerprint_two_pass_from_buffer(buf, &opts),
     }
   }
 
@@ -186,169 +192,103 @@ pub fn fingerprint_diff(
 ) -> napi::Result<AsyncTask<FingerprintDiffTask>> {
   let input = match png_input {
     Either::A(path) => InputBytes::Path(path),
-    Either::B(buffer) => InputBytes::Bytes(buffer.to_vec()),
+    Either::B(buffer) => InputBytes::Bytes(buffer),
   };
 
   Ok(AsyncTask::new(FingerprintDiffTask { input, options }))
 }
 
-/* -------------------------------- PNG decode -------------------------------- */
+/* -------------------------------- streaming decode --------------------------- */
 
-fn decode_png_to_rgba(png_bytes: &[u8]) -> napi::Result<(Vec<u8>, usize, usize)> {
-  let cursor = Cursor::new(png_bytes);
+fn ensure_within_budget(width: usize, height: usize, max_bytes: usize) -> napi::Result<()> {
+  // Streaming path allocates O(width) plus tiny grids
+  // Still protect against pathological widths and overflows
+
+  let row_rgba = width
+    .checked_mul(4)
+    .ok_or_else(|| napi::Error::from_reason("Row length overflow"))?;
+
+  let row_masks = width
+    .checked_mul(3)
+    .ok_or_else(|| napi::Error::from_reason("Row length overflow"))?;
+
+  let scratch = row_rgba
+    .checked_add(row_masks)
+    .ok_or_else(|| napi::Error::from_reason("Size overflow"))?;
+
+  // Add a small fixed overhead
+  let estimated = scratch.saturating_add(64 * 1024);
+
+  // Also reject obviously absurd pixel counts to avoid long runtimes
+  let _pixels = width.saturating_mul(height);
+
+  if estimated > max_bytes {
+    return Err(napi::Error::from_reason(format!(
+      "Budget too small for image width: width {width}, estimated {estimated} bytes, max {max_bytes} bytes"
+    )));
+  }
+
+  Ok(())
+}
+
+fn open_png_reader_from_path(path: &str) -> napi::Result<png::Reader<BufReader<File>>> {
+  let file = File::open(path)
+    .map_err(|e| napi::Error::from_reason(format!("Failed to open PNG file '{path}': {e}")))?;
+
+  let reader = BufReader::new(file);
+
+  let mut decoder = png::Decoder::new(reader);
+  decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
+
+  decoder
+    .read_info()
+    .map_err(|e| napi::Error::from_reason(format!("PNG decode error: {e}")))
+}
+
+fn open_png_reader_from_buffer(
+  buf: &Buffer,
+) -> napi::Result<png::Reader<BufReader<Cursor<&[u8]>>>> {
+  let cursor = Cursor::new(&buf[..]);
   let reader = BufReader::new(cursor);
 
   let mut decoder = png::Decoder::new(reader);
-
   decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
 
-  let mut reader = decoder
+  decoder
     .read_info()
-    .map_err(|e| napi::Error::from_reason(format!("PNG decode error: {e}")))?;
-
-  let buffer_size = reader
-    .output_buffer_size()
-    .ok_or_else(|| napi::Error::from_reason("PNG output buffer size unknown"))?;
-
-  let mut buf = vec![0u8; buffer_size];
-
-  let info = reader
-    .next_frame(&mut buf)
-    .map_err(|e| napi::Error::from_reason(format!("PNG decode error: {e}")))?;
-
-  let width = info.width as usize;
-  let height = info.height as usize;
-  if info.color_type == png::ColorType::Rgba && info.bit_depth == png::BitDepth::Eight {
-    buf.truncate(info.buffer_size());
-    return Ok((buf, width, height));
-  }
-
-  let bytes = &buf[..info.buffer_size()];
-  let rgba = match (info.color_type, info.bit_depth) {
-    (png::ColorType::Rgb, png::BitDepth::Eight) => rgb8_to_rgba8(bytes, width, height),
-    (png::ColorType::Grayscale, png::BitDepth::Eight) => gray8_to_rgba8(bytes, width, height),
-    (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
-      gray_alpha8_to_rgba8(bytes, width, height)
-    }
-    _ => {
-      return Err(napi::Error::from_reason(format!(
-        "Unsupported PNG format after transform: {:?} {:?}",
-        info.color_type, info.bit_depth
-      )))
-    }
-  };
-
-  Ok((rgba, width, height))
+    .map_err(|e| napi::Error::from_reason(format!("PNG decode error: {e}")))
 }
 
-fn rgb8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
-  let n = width * height;
-  let mut out = vec![0u8; n * 4];
-  for (dst, src_px) in out.chunks_exact_mut(4).zip(src.chunks_exact(3)) {
-    dst[0] = src_px[0];
-    dst[1] = src_px[1];
-    dst[2] = src_px[2];
-    dst[3] = 255;
-  }
-  out
-}
-
-fn gray8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
-  let n = width * height;
-  let mut out = vec![0u8; n * 4];
-  for (dst, &v) in out.chunks_exact_mut(4).zip(src.iter()) {
-    dst[0] = v;
-    dst[1] = v;
-    dst[2] = v;
-    dst[3] = 255;
-  }
-  out
-}
-
-fn gray_alpha8_to_rgba8(src: &[u8], width: usize, height: usize) -> Vec<u8> {
-  let n = width * height;
-  let mut out = vec![0u8; n * 4];
-  for (dst, src_px) in out.chunks_exact_mut(4).zip(src.chunks_exact(2)) {
-    let v = src_px[0];
-    dst[0] = v;
-    dst[1] = v;
-    dst[2] = v;
-    dst[3] = src_px[1];
-  }
-  out
-}
-
-/* ---------------------------- fingerprint internals ---------------------------- */
-
-#[derive(Clone, Copy, Debug)]
-struct Bbox {
-  x: usize,
-  y: usize,
+fn read_next_rgba_row<R: BufRead + Seek>(
+  png: &mut png::Reader<R>,
+  row_out: &mut [u8],
   width: usize,
-  height: usize,
+) -> napi::Result<()> {
+  let row = png
+    .next_row()
+    .map_err(|e| napi::Error::from_reason(format!("PNG decode error: {e}")))?
+    .ok_or_else(|| napi::Error::from_reason("PNG ended early"))?;
+
+  let data = row.data();
+
+  let expected = width
+    .checked_mul(4)
+    .ok_or_else(|| napi::Error::from_reason("Row length overflow"))?;
+
+  if data.len() != expected || row_out.len() != expected {
+    return Err(napi::Error::from_reason(format!(
+      "Unexpected row size: got {}, expected {}",
+      data.len(),
+      expected
+    )));
+  }
+
+  row_out.copy_from_slice(data);
+  Ok(())
 }
 
-#[derive(Clone, Debug)]
-struct BinaryImage {
-  data: Vec<u8>, // 0 or 1
-  width: usize,
-  height: usize,
-}
-
-fn fingerprint_rgba_for_equality(
-  rgba: &[u8],
-  width: usize,
-  height: usize,
-  options: &EqualityFingerprintOptions,
-) -> String {
-  let mask = extract_red_mask(rgba, width, height, options.red_threshold);
-
-  let mask2 = if options.dilate_radius == 1 {
-    dilate_radius1(&mask, width, height)
-  } else {
-    mask
-  };
-
-  let bbox = match compute_bbox(&mask2, width, height) {
-    Some(b) => b,
-    None => return "empty".to_string(),
-  };
-
-  let cropped = crop_mask(&mask2, width, &bbox);
-
-  let normalized = if options.pad_to_square {
-    pad_binary_to_square(&cropped.data, cropped.width, cropped.height)
-  } else {
-    cropped
-  };
-
-  let h = hash_grid_density(
-    &normalized.data,
-    normalized.width,
-    normalized.height,
-    options.grid_size,
-    options.grid_size,
-    &options.density_thresholds,
-  );
-
-  let t_joined = options
-    .density_thresholds
-    .iter()
-    .map(|v| format!("{v}"))
-    .collect::<Vec<_>>()
-    .join(",");
-
-  format!(
-    "v1:g{}:d{}:t{}:{:016x}",
-    options.grid_size, options.dilate_radius, t_joined, h
-  )
-}
-
-fn extract_red_mask(rgba: &[u8], width: usize, height: usize, t: RedThreshold) -> Vec<u8> {
-  let n = width * height;
-  let mut out = vec![0u8; n];
-
-  for (dst, px) in out.iter_mut().zip(rgba.chunks_exact(4)) {
+fn fill_mask_row(rgba_row: &[u8], mask_out: &mut [u8], t: RedThreshold) {
+  for (dst, px) in mask_out.iter_mut().zip(rgba_row.chunks_exact(4)) {
     let r = px[0];
     let g = px[1];
     let b = px[2];
@@ -360,149 +300,474 @@ fn extract_red_mask(rgba: &[u8], width: usize, height: usize, t: RedThreshold) -
       0
     };
   }
-
-  out
 }
 
-fn dilate_radius1(mask: &[u8], width: usize, height: usize) -> Vec<u8> {
-  let mut out = vec![0u8; mask.len()];
+/* -------------------------------- two pass algo ------------------------------ */
+
+#[derive(Clone, Copy, Debug)]
+struct Bbox {
+  x: usize,
+  y: usize,
+  width: usize,
+  height: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BboxState {
+  min_x: usize,
+  min_y: usize,
+  max_x: isize,
+  max_y: isize,
+}
+
+impl BboxState {
+  fn new(width: usize, height: usize) -> Self {
+    Self {
+      min_x: width,
+      min_y: height,
+      max_x: -1,
+      max_y: -1,
+    }
+  }
+
+  fn update(&mut self, x: usize, y: usize) {
+    if x < self.min_x {
+      self.min_x = x;
+    }
+    if y < self.min_y {
+      self.min_y = y;
+    }
+    if (x as isize) > self.max_x {
+      self.max_x = x as isize;
+    }
+    if (y as isize) > self.max_y {
+      self.max_y = y as isize;
+    }
+  }
+
+  fn into_bbox(self) -> Option<Bbox> {
+    if self.max_x < self.min_x as isize || self.max_y < self.min_y as isize {
+      return None;
+    }
+
+    Some(Bbox {
+      x: self.min_x,
+      y: self.min_y,
+      width: (self.max_x as usize) - self.min_x + 1,
+      height: (self.max_y as usize) - self.min_y + 1,
+    })
+  }
+}
+
+#[derive(Clone, Copy)]
+struct BboxUpdateCtx {
+  y: usize,
+  width: usize,
+  dilate_radius: u8,
+}
+
+#[derive(Clone, Copy)]
+struct AccumulateCtx<'a> {
+  bbox: &'a Bbox,
+  off_x: usize,
+  off_y: usize,
+  norm_w: usize,
+  norm_h: usize,
+  grid_w: usize,
+  grid_h: usize,
+  dilate_radius: u8,
+}
+
+fn fingerprint_two_pass_from_path(
+  path: &str,
+  opts: &EqualityFingerprintOptions,
+) -> napi::Result<String> {
+  let bbox = compute_bbox_streaming_from_path(path, opts)?;
+
+  let Some(bbox) = bbox else {
+    return Ok("empty".to_string());
+  };
+
+  let hash = accumulate_grid_streaming_from_path(path, opts, &bbox)?;
+  Ok(format_fingerprint(opts, hash))
+}
+
+fn fingerprint_two_pass_from_buffer(
+  buf: &Buffer,
+  opts: &EqualityFingerprintOptions,
+) -> napi::Result<String> {
+  let bbox = compute_bbox_streaming_from_buffer(buf, opts)?;
+
+  let Some(bbox) = bbox else {
+    return Ok("empty".to_string());
+  };
+
+  let hash = accumulate_grid_streaming_from_buffer(buf, opts, &bbox)?;
+  Ok(format_fingerprint(opts, hash))
+}
+
+fn format_fingerprint(opts: &EqualityFingerprintOptions, h: u64) -> String {
+  let t_joined = opts
+    .density_thresholds
+    .iter()
+    .map(|v| format!("{v}"))
+    .collect::<Vec<_>>()
+    .join(",");
+
+  format!(
+    "v1:g{}:d{}:t{}:{:016x}",
+    opts.grid_size, opts.dilate_radius, t_joined, h
+  )
+}
+
+/* ------------------------- pass 1: bbox streaming ------------------------- */
+
+fn compute_bbox_streaming_from_path(
+  path: &str,
+  opts: &EqualityFingerprintOptions,
+) -> napi::Result<Option<Bbox>> {
+  let mut png = open_png_reader_from_path(path)?;
+  compute_bbox_streaming(&mut png, opts)
+}
+
+fn compute_bbox_streaming_from_buffer(
+  buf: &Buffer,
+  opts: &EqualityFingerprintOptions,
+) -> napi::Result<Option<Bbox>> {
+  let mut png = open_png_reader_from_buffer(buf)?;
+  compute_bbox_streaming(&mut png, opts)
+}
+
+fn compute_bbox_streaming<R: BufRead + Seek>(
+  png: &mut png::Reader<R>,
+  opts: &EqualityFingerprintOptions,
+) -> napi::Result<Option<Bbox>> {
+  let width = png.info().width as usize;
+  let height = png.info().height as usize;
+
+  ensure_within_budget(width, height, opts.max_bytes)?;
+
+  let row_len = width
+    .checked_mul(4)
+    .ok_or_else(|| napi::Error::from_reason("Row length overflow"))?;
+
+  let mut rgba_row = vec![0u8; row_len];
+
+  let mut prev = vec![0u8; width];
+  let mut curr = vec![0u8; width];
+  let mut next = vec![0u8; width];
+
+  let mut have_prev = false;
+  let mut have_curr = false;
+
+  let mut bbox_state = BboxState::new(width, height);
 
   for y in 0..height {
-    let y0 = y.saturating_sub(1);
-    let y1 = (y + 1).min(height - 1);
+    read_next_rgba_row(png, &mut rgba_row, width)?;
+    fill_mask_row(&rgba_row, &mut next, opts.red_threshold);
 
-    for x in 0..width {
-      let x0 = x.saturating_sub(1);
-      let x1 = (x + 1).min(width - 1);
+    if !have_curr {
+      curr.copy_from_slice(&next);
+      have_curr = true;
+      continue;
+    }
 
-      let mut v = 0u8;
+    if !have_prev {
+      prev.copy_from_slice(&curr);
+      curr.copy_from_slice(&next);
+      have_prev = true;
+      continue;
+    }
 
-      'outer: for yy in y0..=y1 {
-        let row = yy * width;
-        for xx in x0..=x1 {
-          if mask[row + xx] == 1 {
-            v = 1;
-            break 'outer;
-          }
-        }
+    let ctx = BboxUpdateCtx {
+      y: y - 1,
+      width,
+      dilate_radius: opts.dilate_radius,
+    };
+
+    update_bbox_from_dilated_row(&prev, &curr, &next, ctx, &mut bbox_state);
+
+    prev.copy_from_slice(&curr);
+    curr.copy_from_slice(&next);
+  }
+
+  if have_curr {
+    if have_prev {
+      if height >= 2 {
+        let ctx = BboxUpdateCtx {
+          y: height - 2,
+          width,
+          dilate_radius: opts.dilate_radius,
+        };
+        update_bbox_from_dilated_row(&prev, &curr, &next, ctx, &mut bbox_state);
       }
 
-      out[y * width + x] = v;
+      if height >= 1 {
+        let ctx = BboxUpdateCtx {
+          y: height - 1,
+          width,
+          dilate_radius: opts.dilate_radius,
+        };
+        update_bbox_from_dilated_row(&curr, &next, &next, ctx, &mut bbox_state);
+      }
+    } else {
+      let ctx = BboxUpdateCtx {
+        y: 0,
+        width,
+        dilate_radius: opts.dilate_radius,
+      };
+      update_bbox_from_dilated_row(&curr, &curr, &curr, ctx, &mut bbox_state);
     }
   }
 
-  out
+  Ok(bbox_state.into_bbox())
 }
 
-fn compute_bbox(mask: &[u8], width: usize, height: usize) -> Option<Bbox> {
-  let mut min_x = width;
-  let mut min_y = height;
-  let mut max_x: isize = -1;
-  let mut max_y: isize = -1;
+fn update_bbox_from_dilated_row(
+  prev: &[u8],
+  curr: &[u8],
+  next: &[u8],
+  ctx: BboxUpdateCtx,
+  bbox: &mut BboxState,
+) {
+  if ctx.dilate_radius == 0 {
+    for (x, &v) in curr.iter().enumerate() {
+      if v == 1 {
+        bbox.update(x, ctx.y);
+      }
+    }
+    return;
+  }
+
+  for (x, _) in curr.iter().enumerate() {
+    let x0 = x.saturating_sub(1);
+    let x1 = (x + 1).min(ctx.width - 1);
+
+    let mut on = false;
+    for xx in x0..=x1 {
+      if prev[xx] == 1 || curr[xx] == 1 || next[xx] == 1 {
+        on = true;
+        break;
+      }
+    }
+
+    if on {
+      bbox.update(x, ctx.y);
+    }
+  }
+}
+
+/* --------------------- pass 2: accumulate grid streaming --------------------- */
+
+fn accumulate_grid_streaming_from_path(
+  path: &str,
+  opts: &EqualityFingerprintOptions,
+  bbox: &Bbox,
+) -> napi::Result<u64> {
+  let mut png = open_png_reader_from_path(path)?;
+  accumulate_grid_streaming(&mut png, opts, bbox)
+}
+
+fn accumulate_grid_streaming_from_buffer(
+  buf: &Buffer,
+  opts: &EqualityFingerprintOptions,
+  bbox: &Bbox,
+) -> napi::Result<u64> {
+  let mut png = open_png_reader_from_buffer(buf)?;
+  accumulate_grid_streaming(&mut png, opts, bbox)
+}
+
+fn accumulate_grid_streaming<R: BufRead + Seek>(
+  png: &mut png::Reader<R>,
+  opts: &EqualityFingerprintOptions,
+  bbox: &Bbox,
+) -> napi::Result<u64> {
+  let width = png.info().width as usize;
+  let height = png.info().height as usize;
+
+  let row_len = width
+    .checked_mul(4)
+    .ok_or_else(|| napi::Error::from_reason("Row length overflow"))?;
+
+  let mut rgba_row = vec![0u8; row_len];
+
+  let mut prev = vec![0u8; width];
+  let mut curr = vec![0u8; width];
+  let mut next = vec![0u8; width];
+
+  let mut have_prev = false;
+  let mut have_curr = false;
+
+  let side = if opts.pad_to_square {
+    bbox.width.max(bbox.height)
+  } else {
+    // For compatibility, treat the cropped rectangle as the working surface
+    // norm_w and norm_h are still used to compute cell areas
+    bbox.width.max(1).max(bbox.height.max(1))
+  };
+
+  let (off_x, off_y, norm_w, norm_h) = if opts.pad_to_square {
+    (
+      (side - bbox.width) / 2,
+      (side - bbox.height) / 2,
+      side,
+      side,
+    )
+  } else {
+    (0, 0, bbox.width.max(1), bbox.height.max(1))
+  };
+
+  let grid_w = opts.grid_size;
+  let grid_h = opts.grid_size;
+
+  let mut counts = vec![0u32; grid_w * grid_h];
+
+  let ctx = AccumulateCtx {
+    bbox,
+    off_x,
+    off_y,
+    norm_w,
+    norm_h,
+    grid_w,
+    grid_h,
+    dilate_radius: opts.dilate_radius,
+  };
 
   for y in 0..height {
-    let row = y * width;
-    for x in 0..width {
-      if mask[row + x] == 1 {
-        if x < min_x {
-          min_x = x;
-        }
-        if y < min_y {
-          min_y = y;
-        }
-        if (x as isize) > max_x {
-          max_x = x as isize;
-        }
-        if (y as isize) > max_y {
-          max_y = y as isize;
-        }
+    read_next_rgba_row(png, &mut rgba_row, width)?;
+    fill_mask_row(&rgba_row, &mut next, opts.red_threshold);
+
+    if !have_curr {
+      curr.copy_from_slice(&next);
+      have_curr = true;
+      continue;
+    }
+
+    if !have_prev {
+      prev.copy_from_slice(&curr);
+      curr.copy_from_slice(&next);
+      have_prev = true;
+      continue;
+    }
+
+    accumulate_from_dilated_row(&prev, &curr, &next, y - 1, ctx, &mut counts);
+
+    prev.copy_from_slice(&curr);
+    curr.copy_from_slice(&next);
+  }
+
+  if height >= 2 {
+    accumulate_from_dilated_row(&prev, &curr, &next, height - 2, ctx, &mut counts);
+  }
+
+  if height >= 1 {
+    accumulate_from_dilated_row(&curr, &next, &next, height - 1, ctx, &mut counts);
+  }
+
+  Ok(hash_counts_density(
+    &counts,
+    norm_w,
+    norm_h,
+    grid_w,
+    grid_h,
+    &opts.density_thresholds,
+  ))
+}
+
+fn accumulate_from_dilated_row(
+  prev: &[u8],
+  curr: &[u8],
+  next: &[u8],
+  y: usize,
+  ctx: AccumulateCtx<'_>,
+  counts: &mut [u32],
+) {
+  let bbox = ctx.bbox;
+
+  if y < bbox.y || y >= bbox.y + bbox.height {
+    return;
+  }
+
+  let x_start = bbox.x;
+  let x_end = bbox.x + bbox.width;
+
+  if ctx.dilate_radius == 0 {
+    for (x, &v) in curr.iter().enumerate().take(x_end).skip(x_start) {
+      if v == 1 {
+        accumulate_pixel(x, y, ctx, counts);
       }
     }
+    return;
   }
 
-  if max_x < min_x as isize || max_y < min_y as isize {
-    return None;
-  }
+  let width = curr.len();
 
-  Some(Bbox {
-    x: min_x,
-    y: min_y,
-    width: (max_x as usize) - min_x + 1,
-    height: (max_y as usize) - min_y + 1,
-  })
-}
+  for (x, _) in curr.iter().enumerate().take(x_end).skip(x_start) {
+    let x0 = x.saturating_sub(1);
+    let x1 = (x + 1).min(width - 1);
 
-fn crop_mask(mask: &[u8], src_width: usize, bbox: &Bbox) -> BinaryImage {
-  let mut out = vec![0u8; bbox.width * bbox.height];
+    let mut on = false;
+    for xx in x0..=x1 {
+      if prev[xx] == 1 || curr[xx] == 1 || next[xx] == 1 {
+        on = true;
+        break;
+      }
+    }
 
-  for yy in 0..bbox.height {
-    let src_row = (bbox.y + yy) * src_width;
-    let dst_row = yy * bbox.width;
-
-    for xx in 0..bbox.width {
-      out[dst_row + xx] = mask[src_row + (bbox.x + xx)];
+    if on {
+      accumulate_pixel(x, y, ctx, counts);
     }
   }
-
-  BinaryImage {
-    data: out,
-    width: bbox.width,
-    height: bbox.height,
-  }
 }
 
-fn pad_binary_to_square(src: &[u8], src_w: usize, src_h: usize) -> BinaryImage {
-  let side = src_w.max(src_h);
-  let mut out = vec![0u8; side * side];
+fn accumulate_pixel(x: usize, y: usize, ctx: AccumulateCtx<'_>, counts: &mut [u32]) {
+  let bbox = ctx.bbox;
 
-  let off_x = (side - src_w) / 2;
-  let off_y = (side - src_h) / 2;
+  let nx = (x - bbox.x) + ctx.off_x;
+  let ny = (y - bbox.y) + ctx.off_y;
 
-  for y in 0..src_h {
-    let dst_row = (y + off_y) * side;
-    let src_row = y * src_w;
+  let gx = (nx * ctx.grid_w) / ctx.norm_w.max(1);
+  let gy = (ny * ctx.grid_h) / ctx.norm_h.max(1);
 
-    for x in 0..src_w {
-      out[dst_row + (x + off_x)] = src[src_row + x];
-    }
-  }
+  let gx = gx.min(ctx.grid_w - 1);
+  let gy = gy.min(ctx.grid_h - 1);
 
-  BinaryImage {
-    data: out,
-    width: side,
-    height: side,
-  }
+  counts[gy * ctx.grid_w + gx] += 1;
 }
 
-fn hash_grid_density(
-  src: &[u8],
+/* -------------------------------- hashing ---------------------------------- */
+
+fn hash_counts_density(
+  counts: &[u32],
   src_w: usize,
   src_h: usize,
   grid_w: usize,
   grid_h: usize,
   thresholds: &[f32],
 ) -> u64 {
-  let integral = build_integral_image(src, src_w, src_h);
   let mut hash: u64 = 0xcbf29ce484222325;
   let prime: u64 = 0x00000100000001b3;
-  // Stream packed 2-bit quantized values into the hash to avoid extra buffers.
+
   let mut packed_byte: u8 = 0;
   let mut byte_shift: u8 = 0;
 
   for gy in 0..grid_h {
     let y0 = (gy * src_h) / grid_h;
     let y1 = ((gy + 1) * src_h) / grid_h;
+    let cell_h = (y1.saturating_sub(y0)).max(1);
 
     for gx in 0..grid_w {
       let x0 = (gx * src_w) / grid_w;
       let x1 = ((gx + 1) * src_w) / grid_w;
+      let cell_w = (x1.saturating_sub(x0)).max(1);
 
-      let area = ((x1.saturating_sub(x0)) * (y1.saturating_sub(y0))).max(1);
-      let sum = rect_sum(&integral, src_w, x0, y0, x1, y1);
-      let density = (sum as f32) / (area as f32);
+      let area = (cell_w * cell_h) as f32;
+      let sum = counts[gy * grid_w + gx] as f32;
+      let density = sum / area;
 
       let v = quantize_density(density, thresholds) & 3;
       packed_byte |= v << byte_shift;
+
       if byte_shift == 6 {
         hash ^= packed_byte as u64;
         hash = hash.wrapping_mul(prime);
@@ -529,44 +794,4 @@ fn quantize_density(density: f32, thresholds: &[f32]) -> u8 {
     }
   }
   thresholds.len() as u8
-}
-
-fn build_integral_image(src: &[u8], src_w: usize, src_h: usize) -> Vec<u32> {
-  let mut out = vec![0u32; src_w * src_h];
-
-  for y in 0..src_h {
-    let mut row_sum: u32 = 0;
-    let row = y * src_w;
-
-    for x in 0..src_w {
-      row_sum += src[row + x] as u32;
-      let above = if y > 0 { out[(y - 1) * src_w + x] } else { 0 };
-      out[row + x] = above + row_sum;
-    }
-  }
-
-  out
-}
-
-// Sum on rectangle [x0,x1) x [y0,y1)
-fn rect_sum(integral: &[u32], w: usize, x0: usize, y0: usize, x1: usize, y1: usize) -> u32 {
-  let xa = x0 as isize - 1;
-  let ya = y0 as isize - 1;
-  let xb = x1 as isize - 1;
-  let yb = y1 as isize - 1;
-
-  let a = get_integral(integral, w, xa, ya);
-  let b = get_integral(integral, w, xb, ya);
-  let c = get_integral(integral, w, xa, yb);
-  let d = get_integral(integral, w, xb, yb);
-
-  d.wrapping_sub(b).wrapping_sub(c).wrapping_add(a)
-}
-
-fn get_integral(integral: &[u32], w: usize, x: isize, y: isize) -> u32 {
-  if x < 0 || y < 0 {
-    0
-  } else {
-    integral[y as usize * w + x as usize]
-  }
 }
