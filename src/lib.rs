@@ -263,11 +263,17 @@ fn read_next_rgba_row<R: BufRead + Seek>(
   png: &mut png::Reader<R>,
   row_out: &mut [u8],
   width: usize,
-) -> napi::Result<()> {
-  let row = png
-    .next_row()
-    .map_err(|e| napi::Error::from_reason(format!("PNG decode error: {e}")))?
-    .ok_or_else(|| napi::Error::from_reason("PNG ended early"))?;
+) -> napi::Result<bool> {
+  let row = match png.next_row() {
+    Ok(Some(row)) => row,
+    Ok(None) => return Ok(false),
+    Err(err) => {
+      if is_unexpected_eof_decode_error(&err) {
+        return Ok(false);
+      }
+      return Err(napi::Error::from_reason(format!("PNG decode error: {err}")));
+    }
+  };
 
   let data = row.data();
 
@@ -284,7 +290,17 @@ fn read_next_rgba_row<R: BufRead + Seek>(
   }
 
   row_out.copy_from_slice(data);
-  Ok(())
+  Ok(true)
+}
+
+fn is_unexpected_eof_decode_error(err: &png::DecodingError) -> bool {
+  match err {
+    png::DecodingError::IoError(io) => io.kind() == std::io::ErrorKind::UnexpectedEof,
+    _ => err
+      .to_string()
+      .to_lowercase()
+      .contains("unexpected end of file"),
+  }
 }
 
 fn fill_mask_row(rgba_row: &[u8], mask_out: &mut [u8], t: RedThreshold) {
@@ -462,13 +478,18 @@ fn compute_bbox_streaming<R: BufRead + Seek>(
 
   let mut bbox_state = BboxState::new(width, height);
 
-  for y in 0..height {
-    read_next_rgba_row(png, &mut rgba_row, width)?;
+  let mut y = 0usize;
+
+  while y < height {
+    if !read_next_rgba_row(png, &mut rgba_row, width)? {
+      break;
+    }
     fill_mask_row(&rgba_row, &mut next, opts.red_threshold);
 
     if !have_curr {
       curr.copy_from_slice(&next);
       have_curr = true;
+      y += 1;
       continue;
     }
 
@@ -476,6 +497,7 @@ fn compute_bbox_streaming<R: BufRead + Seek>(
       prev.copy_from_slice(&curr);
       curr.copy_from_slice(&next);
       have_prev = true;
+      y += 1;
       continue;
     }
 
@@ -489,22 +511,23 @@ fn compute_bbox_streaming<R: BufRead + Seek>(
 
     prev.copy_from_slice(&curr);
     curr.copy_from_slice(&next);
+    y += 1;
   }
 
   if have_curr {
     if have_prev {
-      if height >= 2 {
+      if y >= 2 {
         let ctx = BboxUpdateCtx {
-          y: height - 2,
+          y: y - 2,
           width,
           dilate_radius: opts.dilate_radius,
         };
         update_bbox_from_dilated_row(&prev, &curr, &next, ctx, &mut bbox_state);
       }
 
-      if height >= 1 {
+      if y >= 1 {
         let ctx = BboxUpdateCtx {
-          y: height - 1,
+          y: y - 1,
           width,
           dilate_radius: opts.dilate_radius,
         };
@@ -633,13 +656,18 @@ fn accumulate_grid_streaming<R: BufRead + Seek>(
     dilate_radius: opts.dilate_radius,
   };
 
-  for y in 0..height {
-    read_next_rgba_row(png, &mut rgba_row, width)?;
+  let mut y = 0usize;
+
+  while y < height {
+    if !read_next_rgba_row(png, &mut rgba_row, width)? {
+      break;
+    }
     fill_mask_row(&rgba_row, &mut next, opts.red_threshold);
 
     if !have_curr {
       curr.copy_from_slice(&next);
       have_curr = true;
+      y += 1;
       continue;
     }
 
@@ -647,6 +675,7 @@ fn accumulate_grid_streaming<R: BufRead + Seek>(
       prev.copy_from_slice(&curr);
       curr.copy_from_slice(&next);
       have_prev = true;
+      y += 1;
       continue;
     }
 
@@ -654,14 +683,15 @@ fn accumulate_grid_streaming<R: BufRead + Seek>(
 
     prev.copy_from_slice(&curr);
     curr.copy_from_slice(&next);
+    y += 1;
   }
 
-  if height >= 2 {
-    accumulate_from_dilated_row(&prev, &curr, &next, height - 2, ctx, &mut counts);
+  if y >= 2 {
+    accumulate_from_dilated_row(&prev, &curr, &next, y - 2, ctx, &mut counts);
   }
 
-  if height >= 1 {
-    accumulate_from_dilated_row(&curr, &next, &next, height - 1, ctx, &mut counts);
+  if y >= 1 {
+    accumulate_from_dilated_row(&curr, &next, &next, y - 1, ctx, &mut counts);
   }
 
   Ok(hash_counts_density(
