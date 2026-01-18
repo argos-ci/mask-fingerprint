@@ -31,6 +31,11 @@ describe('diff fingerprint', () => {
     const fA3 = await generateFingerprintFromFilename('diff-A3.png')
     const fB1 = await generateFingerprintFromFilename('diff-B1.png')
     const fLong = await generateFingerprintFromFilename('long-diff.png')
+    const weirdDiff = await generateFingerprintFromFilename('weird-diff.png')
+    const weirdDiff2 = await generateFingerprintFromFilename('weird-diff-2.png')
+
+    expect(weirdDiff).toBe('v1:g16:d1:t0.002,0.02,0.08:badfb9bd5eea0beb')
+    expect(weirdDiff2).toBe('v1:g16:d1:t0.002,0.02,0.08:ccb73aa8a5d0317b')
 
     expect(fA1).toBe('v1:g16:d1:t0.002,0.02,0.08:202566ca9533046b')
     expect(fA1).toBe(fA2)
